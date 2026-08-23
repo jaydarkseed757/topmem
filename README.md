@@ -1,4 +1,4 @@
-# topmem 1.0
+# topmem 1.1.0
 
 Report the processes consuming the most memory on a Linux host — and, with
 snapshots, show what is *growing*.
@@ -28,6 +28,7 @@ Two columns depend on kernel version:
 | Feature | Needs | RHEL 8 (4.18) | RHEL 9 (5.14) |
 |---|---|---|---|
 | `--pss` (`smaps_rollup`) | Linux 4.14+ | yes | yes |
+| `--group-by unit` (`cgroup`) | any systemd host | yes | yes |
 | KSM column (`ksm_stat`) | Linux 6.1+ | no | no |
 
 ## Installation
@@ -45,6 +46,7 @@ topmem.sh --diff OLD_SNAPSHOT NEW_SNAPSHOT
 
 | Option | Description |
 |---|---|
+| `-g`, `--group-by <BY>` | Aggregate by `name` or `unit`. Default `name`. |
 | `-s`, `--sort <TYPE>` | Sort column: `rss`, `pss`, `swap`, `ksm`. Default `rss`. `pss` requires `--pss`. |
 | `-u`, `--unit <UNIT>` | Size unit: `auto`, `K`, `M`, `G`. Default `auto`. |
 | `--pss` | Collect proportional set size from `smaps_rollup`. |
@@ -53,17 +55,22 @@ topmem.sh --diff OLD_SNAPSHOT NEW_SNAPSHOT
 | `--oom-log` | Append recent kernel OOM kills from the journal. |
 | `-a`, `--all` | Show every command name. Cannot be combined with `N`. |
 | `--snapshot FILE` | Write results to `FILE` for later comparison. |
-| `--diff OLD NEW` | Compare two snapshots and report change per command. |
+| `--diff OLD NEW` | Compare two snapshots and report change per group. |
+| `-w`, `--warn <PCT>` | Host memory used percentage meaning WARNING. |
+| `-c`, `--crit <PCT>` | Host memory used percentage meaning CRITICAL. |
 | `-V`, `--version` | Print version and exit. |
 | `-h`, `--help` | Print help and exit. |
 | `--` | End of options. A following operand is treated as `N`. |
 
-Long options also accept `--sort=rss`, `--unit=G`, `--snapshot=FILE`.
+Long options also accept `--sort=rss`, `--group-by=unit`, `--unit=G`,
+`--warn=80`, `--snapshot=FILE`.
 
 ```bash
 topmem.sh                                  # top 10 by resident memory
 topmem.sh 20 --sort swap                   # top 20 by swap
 topmem.sh --pss --sort pss                 # rank by proportional set size
+topmem.sh --group-by unit                  # aggregate by systemd unit
+topmem.sh --warn 80 --crit 90              # run as a monitoring check
 topmem.sh --oom-log                        # add recent OOM kills
 topmem.sh --tsv --all --no-header          # machine-readable, every row
 topmem.sh --snapshot /var/tmp/mem.snap     # record for later
@@ -130,7 +137,7 @@ rss_kb	swap_kb	ksm_bytes	name	pss_kb	oom_score
 | `rss_kb` | 1 | kibibytes | Unrounded |
 | `swap_kb` | 2 | kibibytes | Unrounded |
 | `ksm_bytes` | 3 | **bytes** | Signed — negative when a process is a net loss for KSM |
-| `name` | 4 | — | Full command basename, never truncated |
+| `name` / `unit` | 4 | — | The grouping key, never truncated. Header word follows `--group-by` |
 | `pss_kb` | 5 | kibibytes | `-1` when `--pss` was not given, distinct from a genuine `0` |
 | `oom_score` | 6 | — | Highest score in the group |
 
@@ -148,6 +155,60 @@ looks 1024× off is the classic symptom of dividing them the same way.
 # every command over 1 GiB resident
 topmem.sh --tsv --all | awk -F'\t' 'NR > 1 && $1 > 1048576 { print $4 }'
 ```
+
+### TSV for `--diff`
+
+`--diff --tsv` emits deltas in the same raw units:
+
+```
+$ topmem.sh --diff old.snap new.snap --tsv
+change	before	after	key
+2411724	1129472	3541196	tomcat.service
+9999	0	9999	newcomer.service
+-4096	636928	632832	postgresql.service
+```
+
+| Field | Position | Notes |
+|---|---|---|
+| `change` | 1 | `after` minus `before`; signed |
+| `before` | 2 | Value in the older snapshot, 0 if absent |
+| `after` | 3 | Value in the newer snapshot, 0 if absent |
+| `key` | 4 | Command name or unit, per the snapshots' grouping |
+
+Units follow whichever column `--sort` selected: kibibytes for `rss`, `pss`,
+and `swap`; **bytes** for `ksm`.
+
+## Grouping
+
+By default rows are keyed on the **basename of the command**, so
+`/usr/bin/python3` and `/usr/local/bin/python3` sum into a single `python3` row.
+
+`--group-by unit` keys on the **systemd unit** instead, read from
+`/proc/<pid>/cgroup`:
+
+```
+topmem.sh 1.1.0 on web01 — 15.6G total, 3.2G available (20.5% free) — showing 6 units
+UNIT                             RSS    %MEM      SWAP       KSM   OOM
+machine-qemu\x2d3.scope         2.8G    18.2        0K      512M   134
+tomcat.service                  1.1G     7.0       48M        0K    89
+postgresql.service              622M     3.9        0K        0K    41
+```
+
+This is usually closer to how you would act on the result: you restart
+`tomcat.service`, not "the java processes." It also folds a unit's workers,
+helpers, and forked children into one row regardless of what they are called.
+
+Both cgroup layouts are handled — v2's single `0::` hierarchy and v1's
+`name=systemd` line. The innermost unit-suffixed path component wins, so
+`/system.slice/foo.service/subgroup` resolves to `foo.service`. A process
+outside any systemd unit — kernel-adjacent processes, some container runtimes,
+anything under a bare `/docker/...` cgroup — is bucketed under `-`.
+
+Unit names are reported exactly as systemd encodes them, escapes included
+(`dev-disk-by\x2duuid.swap`). No unescaping is attempted.
+
+TSV field 4 holds whichever key is in use; its header word follows
+`--group-by`. Field *positions* do not change.
 
 ## Snapshots and diff
 
@@ -183,6 +244,7 @@ A snapshot file is the TSV records with a `#`-prefixed metadata header:
 # topmem-snapshot 1
 # generated: 2026-08-23T16:00:03-04:00
 # host: web01
+# key: name
 # sort: rss
 # mem_total_kb: 16384000
 rss_kb	swap_kb	ksm_bytes	name	pss_kb	oom_score
@@ -190,7 +252,10 @@ rss_kb	swap_kb	ksm_bytes	name	pss_kb	oom_score
 ```
 
 The first line is a format version. `--diff` refuses a file it does not
-recognise rather than misreading the columns. `--tsv` output never carries these
+recognise rather than misreading the columns, and refuses to compare two
+snapshots whose `# key:` lines disagree. Adding `# key:` did not require a
+format bump: readers skip unknown comment lines, and a snapshot without one is
+read as name-keyed. `--tsv` output never carries these
 comment lines; they exist only in snapshot files.
 
 **`--snapshot` implies `--all`** unless you give `N` or `--all` explicitly. A
@@ -200,6 +265,60 @@ top ten is invisible.
 Snapshots are written temp-file-then-rename within the destination directory, so
 a concurrent reader sees either the old file or the new one, never a partial
 write. They land mode 0644 regardless of the script's `umask 077`.
+
+## Monitoring check
+
+`--warn` and `--crit` take host-memory-used percentages and turn the script into
+a Nagios-compatible check:
+
+```
+$ topmem.sh --warn 80 --crit 90
+MEMORY WARNING - 84.1% used (13.1G of 15.6G) | used_pct=84.1%;80;90;0;100 used=13743895KB;;;0;16384000
+top consumers: qemu-kvm 18.2%, tomcat 7.0%, postgres 3.9%
+```
+
+Line one is the status plus perfdata; line two is long output. Thresholds are
+echoed into perfdata so the poller can graph them. Either threshold may be given
+alone. `--crit` is evaluated first, so `--warn 90 --crit 90` reports CRITICAL.
+
+The second line is what a plain `check_mem` cannot give you: the alert arrives
+already naming the three groups to look at, so the first triage step is done.
+
+Percentages are measured against `MemTotal`, using `MemAvailable` rather than
+`free` — cache and reclaimable slab are not counted as used.
+
+`--warn`/`--crit` cannot be combined with `--tsv`, `--diff`, or `--snapshot`;
+a plugin emits one status line and its perfdata, and anything else on stdout
+confuses the poller.
+
+### Exit-code remapping
+
+This is the one place the script's exit contract changes shape, and it is
+deliberate.
+
+| | Normal | With `--warn`/`--crit` |
+|---|---|---|
+| `0` | success | OK |
+| `1` | runtime failure | WARNING |
+| `2` | usage error | CRITICAL |
+| `3` | — | UNKNOWN: usage error, or any failure of the check itself |
+
+Under Nagios convention 1 and 2 are statements about the *host*, so a plugin
+must never use them to report its own malfunction. In check mode both usage
+errors and runtime failures become 3.
+
+Because a usage error can be detected before the flag that would have signalled
+check mode, argv is pre-scanned for `--warn`/`--crit` before parsing begins.
+`topmem.sh --bogus --warn 80` and `topmem.sh --warn 80 --bogus` both exit 3.
+
+Sample Icinga command definition:
+
+```
+define command {
+    command_name    check_topmem
+    command_line    /usr/local/bin/topmem.sh --warn $ARG1$ --crit $ARG2$
+}
+```
 
 ## OOM history
 
@@ -221,6 +340,9 @@ nothing.
 | `1` | Runtime failure — unreadable `/proc`, unsupported kernel for a requested feature, snapshot write failure, unrecognised snapshot format |
 | `2` | Usage error — bad option, missing operand, invalid `N` or unit, mutually exclusive flags |
 
+With `--warn` or `--crit` these are remapped to Nagios convention; see
+[Exit-code remapping](#exit-code-remapping).
+
 All diagnostics go to stderr with a timestamp, script name, PID, and severity, so
 stdout stays clean and pipeable in every mode.
 
@@ -230,9 +352,13 @@ stdout stays clean and pipeable in every mode.
 reads zero throughout. `--sort ksm` refuses to run rather than returning an
 arbitrarily ordered list.
 
-**`--diff` has no TSV mode.** The combination is rejected rather than silently
-ignored. If you need machine-readable deltas today, snapshot to TSV and diff with
-`join` or `awk`.
+**`--group-by unit` says nothing about non-systemd processes.** Anything outside
+a systemd unit lands in a single `-` bucket, which on a container host can be the
+largest row in the table and tells you nothing about what is inside it.
+
+**Snapshots cannot be diffed across groupings.** A name-keyed and a unit-keyed
+snapshot are rejected rather than compared. Snapshots written before 1.1.0 carry
+no grouping marker and are read as name-keyed.
 
 **Non-root runs may be incomplete.** `hidepid=1`/`hidepid=2` hides other users'
 processes, and `smaps_rollup` requires `PTRACE_MODE_READ` — a process whose PSS
