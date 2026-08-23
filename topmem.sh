@@ -3,13 +3,13 @@
 # topmem.sh — report the processes consuming the most memory
 #
 # Scans /proc for every running process, aggregates resident memory, swap, and
-# KSM profit by command name, and prints the top N. Read-only: it reads /proc
-# and writes a table to stdout, and changes nothing on disk.
+# KSM profit by command name, and prints the top N as either a human-readable
+# table or tab-separated records. Read-only: it reads /proc and writes to
+# stdout, and changes nothing on disk.
 #
-# Author:       JDC
-# Created:      2026-08-23
-# Modified:     2026-08-23 
-# Usage:        topmem.sh [-s rss|swap|ksm] [N]
+# Author:       JC
+# Modified:     2026-08-23,
+# Usage:        topmem.sh [-s rss|swap|ksm] [--tsv] [--no-header] [-a | N]
 #
 set -euo pipefail
 
@@ -18,7 +18,9 @@ readonly SCRIPT_NAME="${0##*/}"
 readonly DEFAULT_SIZE=10
 
 SORT_BY='rss'
-SIZE="$DEFAULT_SIZE"
+SIZE="$DEFAULT_SIZE"          # 0 means unlimited; mapfile -n 0 reads every row.
+OUTPUT_FORMAT='table'
+SHOW_HEADER=1
 
 # Per-process results come back in globals. A command substitution would fork a
 # subshell for every PID on the host, which is the dominant cost in this script.
@@ -44,7 +46,7 @@ die()       { log_error "$@"; exit 1; }
 # --- usage -----------------------------------------------------------------
 usage() {
     cat >&2 <<EOF
-Usage: $SCRIPT_NAME [-s rss|swap|ksm] [N]
+Usage: $SCRIPT_NAME [-s rss|swap|ksm] [--tsv] [--no-header] [-a | N]
 Try '$SCRIPT_NAME --help' for more information.
 EOF
     exit 2
@@ -57,7 +59,7 @@ arg_error() {
 
 print_help() {
     cat <<EOF
-Show the top N processes by memory consumption.
+Show the top N processes by memory consumption, grouped by command name.
 
 Usage: $SCRIPT_NAME [OPTIONS] [N]
 
@@ -66,13 +68,20 @@ Arguments:
 
 Options:
   -s, --sort <TYPE>  Column to sort by: rss, swap, ksm [default: rss]
+      --tsv          Emit tab-separated records with raw units, for parsing
+      --no-header    Suppress the header line in either format
+  -a, --all          Show every command name; cannot be combined with N
   -h, --help         Show this message
+
+TSV columns, in order: rss_kb, swap_kb, ksm_bytes, name
+New columns will only ever be appended, so field positions are stable.
 
 Examples:
   $SCRIPT_NAME
   $SCRIPT_NAME 20
   $SCRIPT_NAME --sort swap
   $SCRIPT_NAME -s ksm 25
+  $SCRIPT_NAME --tsv --all --no-header > /var/tmp/topmem.tsv
 EOF
     exit 0
 }
@@ -80,6 +89,7 @@ EOF
 # --- argument parsing ------------------------------------------------------
 parse_arguments() {
     local size_raw=''
+    local all_requested=0
     local end_of_options=0
 
     while (( $# > 0 )); do
@@ -107,6 +117,21 @@ parse_arguments() {
                 shift
                 ;;
 
+            --tsv)
+                OUTPUT_FORMAT='tsv'
+                shift
+                ;;
+
+            --no-header)
+                SHOW_HEADER=0
+                shift
+                ;;
+
+            -a|--all)
+                all_requested=1
+                shift
+                ;;
+
             -h|--help)
                 print_help
                 ;;
@@ -129,7 +154,15 @@ parse_arguments() {
 
     done
 
-    if [[ -n "$size_raw" ]]; then
+    # Rejected rather than resolved by precedence: a caller who wrote both had
+    # one of the two in mind, and guessing which silently truncates their data.
+    if (( all_requested )) && [[ -n "$size_raw" ]]; then
+        arg_error "--all and an explicit N are mutually exclusive"
+    fi
+
+    if (( all_requested )); then
+        SIZE=0
+    elif [[ -n "$size_raw" ]]; then
         if [[ ! "$size_raw" =~ ^[0-9]+$ ]]; then
             arg_error "N must be a positive integer: $size_raw"
         fi
@@ -212,9 +245,12 @@ collect_processes() {
 }
 
 # --- reporting -------------------------------------------------------------
-print_top() {
-    local sort_column output
-    local -a rows=()
+
+# Emits every aggregated record, sorted, one per line, in raw units:
+#   rss_kb \t swap_kb \t ksm_bytes \t name
+# This is the TSV contract and the table's input; the two must not diverge.
+aggregate_sorted() {
+    local sort_column
 
     case "$SORT_BY" in
         rss)  sort_column=1 ;;
@@ -222,61 +258,82 @@ print_top() {
         ksm)  sort_column=3 ;;
     esac
 
-    # Buffered rather than streamed so the header can state the number of rows
-    # actually printed, which is min(N, distinct command names).
-    output="$(
-        printf '%s\n' "${RECORDS[@]}" \
-        | awk -F '\t' '
-            function basename(path,   n, parts) {
-                n = split(path, parts, "/")
-                return parts[n]
-            }
-            # Key on the basename, not the raw path: /usr/bin/python3 and
-            # /usr/local/bin/python3 belong in one bucket, not two rows that
-            # both render as "python3" and neither of which is the total.
-            {
-                key = basename($4)
-                rss[key]  += $1
-                swap[key] += $2
-                ksm[key]  += $3
-            }
-            # %.0f, not %d: a KSM byte total can exceed a 32-bit int, and
-            # bare %s would let CONVFMT emit 8.38861e+06, which sort -n
-            # cannot compare.
-            END {
-                for (name in rss)
-                    printf "%.0f\t%.0f\t%.0f\t%s\n",
-                           rss[name], swap[name], ksm[name], name
-            }
-          ' \
-        | LC_ALL=C sort -t $'\t' \
-              -k"${sort_column},${sort_column}"nr -k4,4 \
-        | awk -F '\t' -v limit="$SIZE" '
-            # status reports VmRSS and VmSwap in kB; ksm_stat reports profit
-            # in bytes.
-            function kib_mib(k)  { return sprintf("%.0fM", k / 1024) }
-            function byte_mib(b) { return sprintf("%.0fM", b / 1048576) }
+    printf '%s\n' "${RECORDS[@]}" \
+    | awk -F '\t' '
+        function basename(path,   n, parts) {
+            n = split(path, parts, "/")
+            return parts[n]
+        }
+        # Key on the basename, not the raw path: /usr/bin/python3 and
+        # /usr/local/bin/python3 belong in one bucket, not two rows that
+        # both render as "python3" and neither of which is the total.
+        {
+            key = basename($4)
+            rss[key]  += $1
+            swap[key] += $2
+            ksm[key]  += $3
+        }
+        # %.0f, not %d: a KSM byte total can exceed a 32-bit int, and bare
+        # %s would let CONVFMT emit 8.38861e+06, which sort -n cannot compare.
+        END {
+            for (name in rss)
+                printf "%.0f\t%.0f\t%.0f\t%s\n",
+                       rss[name], swap[name], ksm[name], name
+        }
+      ' \
+    | LC_ALL=C sort -t $'\t' \
+          -k"${sort_column},${sort_column}"nr -k4,4
+}
 
-            # Truncate by skipping, not by exiting: an early exit would
-            # SIGPIPE sort, and pipefail would turn that into a failure.
-            NR > limit { next }
-            {
-                name = $4
-                if (length(name) > 25)
-                    name = substr(name, 1, 25) "..."
+print_table() {
+    if (( SHOW_HEADER )); then
+        printf '%-9s %-35s %-9s %-s\n' \
+            'MEMORY' "Top $# processes" 'SWAP' 'KSM'
+    fi
 
-                printf "%-9s %-35s %-9s %-s\n",
-                       kib_mib($1), name, kib_mib($2), byte_mib($3)
-            }
-          '
-    )" || die 'failed to aggregate or sort process records'
+    if (( $# == 0 )); then return 0; fi
 
-    if [[ -n "$output" ]]; then mapfile -t rows <<< "$output"; fi
+    printf '%s\n' "$@" \
+    | awk -F '\t' '
+        # status reports VmRSS and VmSwap in kB; ksm_stat reports profit
+        # in bytes.
+        function kib_mib(k)  { return sprintf("%.0fM", k / 1024) }
+        function byte_mib(b) { return sprintf("%.0fM", b / 1048576) }
+        {
+            name = $4
+            if (length(name) > 25)
+                name = substr(name, 1, 25) "..."
 
-    printf '%-9s %-35s %-9s %-s\n' \
-        'MEMORY' "Top ${#rows[@]} processes" 'SWAP' 'KSM'
+            printf "%-9s %-35s %-9s %-s\n",
+                   kib_mib($1), name, kib_mib($2), byte_mib($3)
+        }
+      ' || die 'failed to format output'
+}
 
-    if (( ${#rows[@]} )); then printf '%s\n' "${rows[@]}"; fi
+print_tsv() {
+    if (( SHOW_HEADER )); then
+        printf 'rss_kb\tswap_kb\tksm_bytes\tname\n'
+    fi
+
+    # Rows already carry the TSV contract; no reformatting, no rounding.
+    if (( $# )); then printf '%s\n' "$@"; fi
+}
+
+report() {
+    local sorted
+    local -a rows=()
+
+    sorted="$(aggregate_sorted)" || die 'failed to aggregate or sort process records'
+
+    # mapfile -n applies the top-N limit in place of head(1). head closing the
+    # pipe would SIGPIPE the upstream sort, and pipefail would report that as a
+    # script failure on an otherwise normal run. -n 0 reads every row.
+    if [[ -n "$sorted" ]]; then mapfile -t -n "$SIZE" rows <<< "$sorted"; fi
+
+    case "$OUTPUT_FORMAT" in
+        table) print_table "${rows[@]}" ;;
+        tsv)   print_tsv   "${rows[@]}" ;;
+    esac
 }
 
 # --- main ------------------------------------------------------------------
@@ -286,7 +343,7 @@ main() {
 
     if (( ${#RECORDS[@]} == 0 )); then die 'no readable processes found in /proc'; fi
 
-    print_top
+    report
 }
 
 main "$@"
