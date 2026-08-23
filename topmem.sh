@@ -6,8 +6,9 @@
 # KSM profit by command name, and prints the top N. Read-only: it reads /proc
 # and writes a table to stdout, and changes nothing on disk.
 #
-# Author:       jc
-# Created:      <2026-08-23>
+# Author:       JDC
+# Created:      2026-08-23
+# Modified:     2026-08-23 
 # Usage:        topmem.sh [-s rss|swap|ksm] [N]
 #
 set -euo pipefail
@@ -162,21 +163,24 @@ read_cmdline() {
 }
 
 read_status() {
-    local key value
+    local key value _ swap_seen=0
     _rss=''
     _swap=0
     while read -r key value _; do
         case "$key" in
-            VmRSS:)  _rss="$value"  ;;
-            VmSwap:) _swap="$value" ;;
+            VmRSS:)  _rss="$value" ;;
+            VmSwap:) _swap="$value"; swap_seen=1 ;;
         esac
+        # Both fields sit in the first third of a ~55-line file; stop there
+        # rather than scanning the remainder once per process on the host.
+        if [[ -n "$_rss" ]] && (( swap_seen )); then break; fi
     done 2>/dev/null < "/proc/$1/status" || return 1
     if [[ -z "$_rss" ]]; then return 1; fi
     return 0
 }
 
 read_ksm() {
-    local key value
+    local key value _
     _ksm=0
     if [[ ! -r "/proc/$1/ksm_stat" ]]; then return 0; fi
     while read -r key value _; do
@@ -209,7 +213,8 @@ collect_processes() {
 
 # --- reporting -------------------------------------------------------------
 print_top() {
-    local sort_column
+    local sort_column output
+    local -a rows=()
 
     case "$SORT_BY" in
         rss)  sort_column=1 ;;
@@ -217,38 +222,46 @@ print_top() {
         ksm)  sort_column=3 ;;
     esac
 
-    printf '%-9s %-35s %-9s %-s\n' \
-        'MEMORY' "Top $SIZE processes" 'SWAP' 'KSM'
-
-    # %d, not %s: awk's CONVFMT would render large sums as 8.38861e+06, which
-    # sort -n cannot compare.
-    printf '%s\n' "${RECORDS[@]}" \
+    # Buffered rather than streamed so the header can state the number of rows
+    # actually printed, which is min(N, distinct command names).
+    output="$(
+        printf '%s\n' "${RECORDS[@]}" \
         | awk -F '\t' '
-            {
-                rss[$4]  += $1
-                swap[$4] += $2
-                ksm[$4]  += $3
-            }
-            END {
-                for (name in rss)
-                    printf "%d\t%d\t%d\t%s\n", rss[name], swap[name], ksm[name], name
-            }
-          ' \
-        | sort -t $'\t' -k"${sort_column},${sort_column}"nr \
-        | awk -F '\t' -v limit="$SIZE" '
             function basename(path,   n, parts) {
                 n = split(path, parts, "/")
                 return parts[n]
             }
-            # status reports VmRSS and VmSwap in kB; ksm_stat reports profit in bytes.
+            # Key on the basename, not the raw path: /usr/bin/python3 and
+            # /usr/local/bin/python3 belong in one bucket, not two rows that
+            # both render as "python3" and neither of which is the total.
+            {
+                key = basename($4)
+                rss[key]  += $1
+                swap[key] += $2
+                ksm[key]  += $3
+            }
+            # %.0f, not %d: a KSM byte total can exceed a 32-bit int, and
+            # bare %s would let CONVFMT emit 8.38861e+06, which sort -n
+            # cannot compare.
+            END {
+                for (name in rss)
+                    printf "%.0f\t%.0f\t%.0f\t%s\n",
+                           rss[name], swap[name], ksm[name], name
+            }
+          ' \
+        | LC_ALL=C sort -t $'\t' \
+              -k"${sort_column},${sort_column}"nr -k4,4 \
+        | awk -F '\t' -v limit="$SIZE" '
+            # status reports VmRSS and VmSwap in kB; ksm_stat reports profit
+            # in bytes.
             function kib_mib(k)  { return sprintf("%.0fM", k / 1024) }
             function byte_mib(b) { return sprintf("%.0fM", b / 1048576) }
 
-            # Truncate by skipping, not by exiting: an early exit would SIGPIPE
-            # sort, and pipefail would turn that into a script failure.
+            # Truncate by skipping, not by exiting: an early exit would
+            # SIGPIPE sort, and pipefail would turn that into a failure.
             NR > limit { next }
             {
-                name = basename($4)
+                name = $4
                 if (length(name) > 25)
                     name = substr(name, 1, 25) "..."
 
@@ -256,6 +269,14 @@ print_top() {
                        kib_mib($1), name, kib_mib($2), byte_mib($3)
             }
           '
+    )" || die 'failed to aggregate or sort process records'
+
+    if [[ -n "$output" ]]; then mapfile -t rows <<< "$output"; fi
+
+    printf '%-9s %-35s %-9s %-s\n' \
+        'MEMORY' "Top ${#rows[@]} processes" 'SWAP' 'KSM'
+
+    if (( ${#rows[@]} )); then printf '%s\n' "${rows[@]}"; fi
 }
 
 # --- main ------------------------------------------------------------------
