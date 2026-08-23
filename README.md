@@ -1,7 +1,3 @@
-
-/
-Claude finished the response
-
 ```bash #!/bin/bash # # topmem - Show processes with the highest memory consumption # # RHEL 8 compatible # No external packages required. # # Usage: # topmem.sh [OPTIONS] [N] # # Examples: # topmem.sh # topmem.sh 20 # topmem.sh --sort swap # topmem.sh -s ksm 20 # set
 
 pasted
