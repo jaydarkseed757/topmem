@@ -45,7 +45,7 @@ topmem.sh [OPTIONS] [N]
 
 | Argument | Description |
 |---|---|
-| `N` | Number of entries to display. Positive integer. Default `10`. |
+| `N` | Maximum number of entries to display. Positive integer. Default `10`. |
 
 ### Options
 
@@ -89,12 +89,29 @@ trailing `...`.
 reported in bytes. The script converts each with the correct divisor — a KSM
 figure that looks 1024× too small is the classic symptom of getting this wrong.
 
+### Grouping
+
+Processes are bucketed by the **basename** of the first `cmdline` field, so
+`/usr/bin/python3` and `/usr/local/bin/python3` sum into a single `python3` row.
+Grouping happens before sorting and truncation, which means the figure shown is
+the true total for that name rather than one path's share of it.
+
+### Ordering
+
+The primary sort is descending on the selected column. Ties break ascending on
+command name under `LC_ALL=C`, so two invocations against an unchanged workload
+produce byte-identical row ordering and the output diffs cleanly.
+
+The header reports the number of rows actually printed, not the requested `N`.
+Asking for 500 on a host with 90 distinct command names prints
+`Top 90 processes`.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Success |
-| `1` | Runtime failure — unreadable `/proc`, unsupported kernel for the requested sort |
+| `1` | Runtime failure — unreadable `/proc`, aggregation or sort failure, unsupported kernel for the requested sort |
 | `2` | Usage error — bad option, missing operand, non-numeric or zero `N` |
 
 All diagnostics go to stderr with a timestamp, script name, PID, and severity, so
@@ -121,24 +138,29 @@ silently. Run as root for a full picture.
 walked. A process that disappears mid-scan is skipped rather than reported as an
 error.
 
-**Grouping is by command name, not by cgroup or user.** Two unrelated programs
-that happen to share a basename — say, two different `python3` services — are
-summed into one row. Where that matters, `ps` with an explicit `-o` format is the
-better tool.
+**Grouping is by name, not by cgroup, user, or path.** Two unrelated programs
+that happen to share a basename — say, a Django service and an unrelated
+maintenance script, both `python3` — are summed into one row. That is a
+deliberate trade for readability. Where the distinction matters, `ps` with an
+explicit `-o` format or a per-cgroup view via `systemd-cgtop` is the better tool.
 
 **Shared pages are counted repeatedly.** RSS includes shared libraries and
 copy-on-write pages, so summing across processes double-counts memory that
 physically exists once. The totals are useful for ranking, not for accounting;
 `smem` with its PSS column is the right tool if you need figures that add up.
 
-## Notes
+## Implementation notes
 
 The script runs under `set -euo pipefail`. Truncation to N rows happens inside
 `awk` rather than via `head`, deliberately: `head` closing the pipe would
 `SIGPIPE` the upstream `sort`, which `pipefail` would then surface as a script
-failure on an otherwise normal run.
+failure on an otherwise normal run. The pipeline as a whole is checked
+explicitly, so a genuine failure — `sort` running out of temp space, say — is
+reported with the script name and PID rather than as a bare error from a
+subprocess.
 
 Per-process data is read with bash builtins rather than `tr`, `head`, and
-per-field `awk` calls. On a host with several hundred processes this removes
-roughly five forks per PID, which is the difference between a script that returns
-promptly and one that noticeably does not.
+per-field `awk` calls, and the scan of `/proc/<pid>/status` stops once both
+fields of interest have been seen. On a host with several hundred processes this
+removes roughly five forks per PID, which is the difference between a script that
+returns promptly and one that noticeably does not.
