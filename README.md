@@ -3,8 +3,9 @@
 Report the processes consuming the most memory on a Linux host.
 
 `topmem.sh` walks `/proc`, aggregates resident memory, swap, and KSM profit by
-command name, and prints the top N. It reads `/proc` and writes a table to
-stdout — it changes nothing on disk and modifies no process state.
+command name, and prints the top N — as a table for a human at a terminal, or as
+tab-separated records for anything else. It reads `/proc` and writes to stdout;
+it changes nothing on disk and modifies no process state.
 
 Unlike `ps` or `top`, results are **grouped by command name**, so twelve browser
 renderers or forty Apache workers appear as a single row carrying their combined
@@ -53,19 +54,27 @@ topmem.sh [OPTIONS] [N]
 |---|---|
 | `-s`, `--sort <TYPE>` | Column to sort by: `rss`, `swap`, or `ksm`. Default `rss`. |
 | `--sort=<TYPE>` | Equivalent to the above. |
+| `--tsv` | Emit tab-separated records with raw units instead of the table. |
+| `--no-header` | Suppress the header line in either format. |
+| `-a`, `--all` | Show every command name. Cannot be combined with `N`. |
 | `-h`, `--help` | Print help and exit 0. |
 | `--` | End of options. A following operand is treated as `N`. |
+
+`--all` and an explicit `N` are rejected together rather than resolved by
+precedence — a caller who wrote both had one of the two in mind, and guessing
+wrong silently truncates their data.
 
 ### Examples
 
 ```bash
-topmem.sh                 # top 10 by resident memory
-topmem.sh 20              # top 20 by resident memory
-topmem.sh --sort swap     # top 10 by swap usage
-topmem.sh -s ksm 25       # top 25 by KSM profit
+topmem.sh                                  # top 10 by resident memory
+topmem.sh 20                               # top 20 by resident memory
+topmem.sh --sort swap                      # top 10 by swap usage
+topmem.sh -s ksm 25                        # top 25 by KSM profit
+topmem.sh --tsv --all --no-header          # every row, machine-readable
 ```
 
-## Output
+## Table output
 
 ```
 MEMORY    Top 10 processes                    SWAP      KSM
@@ -83,28 +92,54 @@ MEMORY    Top 10 processes                    SWAP      KSM
 
 All figures are rounded to whole mebibytes, so anything under about half a MiB
 displays as `0M`. Command names longer than 25 characters are truncated with a
-trailing `...`.
-
-`VmRSS` and `VmSwap` are reported by the kernel in kB; `ksm_process_profit` is
-reported in bytes. The script converts each with the correct divisor — a KSM
-figure that looks 1024× too small is the classic symptom of getting this wrong.
-
-### Grouping
-
-Processes are bucketed by the **basename** of the first `cmdline` field, so
-`/usr/bin/python3` and `/usr/local/bin/python3` sum into a single `python3` row.
-Grouping happens before sorting and truncation, which means the figure shown is
-the true total for that name rather than one path's share of it.
-
-### Ordering
-
-The primary sort is descending on the selected column. Ties break ascending on
-command name under `LC_ALL=C`, so two invocations against an unchanged workload
-produce byte-identical row ordering and the output diffs cleanly.
-
-The header reports the number of rows actually printed, not the requested `N`.
-Asking for 500 on a host with 90 distinct command names prints
+trailing `...`. The header reports the number of rows actually printed, not the
+requested `N`: asking for 500 on a host with 90 distinct command names prints
 `Top 90 processes`.
+
+The table format is for reading, not for parsing. Column positions, padding,
+rounding, and truncation are all subject to change. Use `--tsv` for anything
+programmatic.
+
+## TSV output
+
+```
+$ topmem.sh --tsv 3
+rss_kb	swap_kb	ksm_bytes	name
+2983936	0	537133056	qemu-kvm
+1129472	49152	0	java
+636928	0	0	postgres
+```
+
+| Field | Position | Unit | Notes |
+|---|---|---|---|
+| `rss_kb` | 1 | kibibytes | As reported by the kernel, unrounded |
+| `swap_kb` | 2 | kibibytes | As reported by the kernel, unrounded |
+| `ksm_bytes` | 3 | bytes | Signed — can be negative when a process is a net loss for KSM |
+| `name` | 4 | — | Full command basename, never truncated |
+
+Three properties make this the mode to build against:
+
+- **Raw units.** No rounding to MiB, so a 400 KiB process is distinguishable
+  from a genuinely idle one. The consumer decides on presentation.
+- **Untruncated names.** No 25-character cutoff.
+- **Stable field order.** New columns will only ever be appended. A parser
+  written against positions 1–4 keeps working.
+
+Note the unit difference between fields 1–2 and field 3: the kernel reports
+`VmRSS` and `VmSwap` in kB but `ksm_process_profit` in bytes, and the TSV passes
+both through as-is rather than silently normalising. A KSM figure that looks
+1024× off is the classic symptom of dividing them the same way.
+
+Fields are separated by a single tab, which is what `awk`, `cut`, and `sort` all
+expect by default:
+
+```bash
+# every command over 1 GiB resident
+topmem.sh --tsv --all | awk -F'\t' 'NR > 1 && $1 > 1048576 { print $4 }'
+
+# snapshot for later comparison
+topmem.sh --tsv --all --no-header > "/var/tmp/topmem.$(date +%s).tsv"
+```
 
 ## Exit codes
 
@@ -112,20 +147,16 @@ Asking for 500 on a host with 90 distinct command names prints
 |---|---|
 | `0` | Success |
 | `1` | Runtime failure — unreadable `/proc`, aggregation or sort failure, unsupported kernel for the requested sort |
-| `2` | Usage error — bad option, missing operand, non-numeric or zero `N` |
+| `2` | Usage error — bad option, missing operand, non-numeric or zero `N`, `--all` combined with `N` |
 
 All diagnostics go to stderr with a timestamp, script name, PID, and severity, so
-the table on stdout stays clean and pipeable:
-
-```bash
-topmem.sh 50 | grep -i postgres
-```
+stdout stays clean and pipeable in both output modes.
 
 ## Limitations
 
 **KSM requires a recent kernel.** `/proc/<pid>/ksm_stat` was introduced in Linux
 6.1. RHEL 8 ships 4.18 and RHEL 9 ships 5.14, so on either the KSM column reads
-`0M` for every process. `--sort ksm` refuses to run on such a kernel rather than
+zero for every process. `--sort ksm` refuses to run on such a kernel rather than
 returning an arbitrarily ordered list; the other two sorts work normally and the
 column is simply always zero.
 
@@ -138,11 +169,12 @@ silently. Run as root for a full picture.
 walked. A process that disappears mid-scan is skipped rather than reported as an
 error.
 
-**Grouping is by name, not by cgroup, user, or path.** Two unrelated programs
-that happen to share a basename — say, a Django service and an unrelated
-maintenance script, both `python3` — are summed into one row. That is a
-deliberate trade for readability. Where the distinction matters, `ps` with an
-explicit `-o` format or a per-cgroup view via `systemd-cgtop` is the better tool.
+**Grouping is by name, not by cgroup, user, or path.** Processes are bucketed by
+the basename of the first `cmdline` field, so `/usr/bin/python3` and
+`/usr/local/bin/python3` sum into a single `python3` row — as do two entirely
+unrelated Python services. That is a deliberate trade for readability. Where the
+distinction matters, `ps` with an explicit `-o` format or a per-cgroup view via
+`systemd-cgtop` is the better tool.
 
 **Shared pages are counted repeatedly.** RSS includes shared libraries and
 copy-on-write pages, so summing across processes double-counts memory that
@@ -151,16 +183,23 @@ physically exists once. The totals are useful for ranking, not for accounting;
 
 ## Implementation notes
 
-The script runs under `set -euo pipefail`. Truncation to N rows happens inside
-`awk` rather than via `head`, deliberately: `head` closing the pipe would
+The script runs under `set -euo pipefail`. The top-N limit is applied with
+`mapfile -n` rather than `head`, deliberately: `head` closing the pipe would
 `SIGPIPE` the upstream `sort`, which `pipefail` would then surface as a script
-failure on an otherwise normal run. The pipeline as a whole is checked
+failure on an otherwise normal run. The aggregation pipeline is checked
 explicitly, so a genuine failure — `sort` running out of temp space, say — is
 reported with the script name and PID rather than as a bare error from a
 subprocess.
 
+Both output modes share a single aggregation and sort stage that emits exactly
+the TSV format. The table is a formatting pass over those same rows, which keeps
+the two from drifting apart.
+
+Ordering is descending on the selected column, with ties broken ascending on
+command name under `LC_ALL=C`. Two runs against an unchanged workload produce
+byte-identical output, so snapshots diff cleanly.
+
 Per-process data is read with bash builtins rather than `tr`, `head`, and
 per-field `awk` calls, and the scan of `/proc/<pid>/status` stops once both
 fields of interest have been seen. On a host with several hundred processes this
-removes roughly five forks per PID, which is the difference between a script that
-returns promptly and one that noticeably does not.
+removes roughly five forks per PID.
